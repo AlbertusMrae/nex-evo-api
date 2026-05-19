@@ -251,10 +251,18 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private _lastStream515At = 0;
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
+
+  // Reconnect behaviour for the Baileys "stream:error 515" sequence.
+  // After WhatsApp emits 515 it usually closes with `loggedOut`; that close is *not* a real logout
+  // and we should reconnect. We treat any close arriving within this grace window as 515-driven.
+  private static readonly STREAM_515_RECONNECT_GRACE_MS = 30_000;
+  // The numeric WhatsApp stream-error code that triggers the grace-period reconnect above.
+  private static readonly STREAM_ERROR_CODE_RECONNECT = '515';
 
   public stateConnection: wa.StateConnection = { state: 'close' };
 
@@ -453,7 +461,29 @@ export class BaileysStartupService extends ChannelStartupService {
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406, 408];
-      const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+
+      // FIX: Do not reconnect if it's the initial connection (waiting for QR code)
+      // This prevents infinite loop that blocks QR code generation
+      const isInitialConnection = !this.instance.wuid && (this.instance.qrcode?.count ?? 0) === 0;
+
+      if (isInitialConnection) {
+        this.logger.info('Initial connection closed, waiting for QR code generation...');
+        return;
+      }
+
+      // If a stream:error 515 (Baileys' "restart needed" handshake) just fired,
+      // a follow-up loggedOut is the expected restart signal — not an actual
+      // logout — so reconnect anyway.
+      const recentStream515 = Date.now() - this._lastStream515At < BaileysStartupService.STREAM_515_RECONNECT_GRACE_MS;
+      const shouldReconnect =
+        !codesToNotReconnect.includes(statusCode) || (statusCode === DisconnectReason.loggedOut && recentStream515);
+
+      this.logger.info({
+        message: 'Connection closed, evaluating reconnection',
+        statusCode,
+        shouldReconnect,
+        instanceName: this.instance.name,
+      });
       if (shouldReconnect) {
         await this.connectToWhatsapp(this.phoneNumber);
       } else {
@@ -744,6 +774,12 @@ export class BaileysStartupService extends ChannelStartupService {
       console.log('CB:ack,class:call', packet);
       const payload = { event: 'CB:ack,class:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
+    });
+
+    this.client.ws.on('CB:stream:error', (node: { attrs?: { code?: string | number } }) => {
+      if (String(node?.attrs?.code) === BaileysStartupService.STREAM_ERROR_CODE_RECONNECT) {
+        this._lastStream515At = Date.now();
+      }
     });
 
     this.phoneNumber = number;
